@@ -20,6 +20,24 @@ MTU=8500
 TCP_TIMEOUT=15
 UDP_TIMEOUT=7
 
+# Command used to start the proxy ("sudo" is prepended below).
+# https://github.com/tun2proxy/tun2proxy
+PROXY_ARGS=(tun2proxy-bin --setup --proxy "$PROXY" --mtu "$MTU" \
+    --tcp-timeout "$TCP_TIMEOUT" --udp-timeout "$UDP_TIMEOUT" \
+    --dns virtual -6 -v "$VERBOSITY_LEVEL")
+
+STATE_DIR="$HOME/.local/state/t2p"
+LOG_FILE="$STATE_DIR/t2p.log"
+mkdir -p "$STATE_DIR"
+
+# Substring identifying our proxy process among all running processes.
+PROXY_MATCH="tun2proxy-bin"
+
+# Poll interval/count when waiting for the process to appear/disappear.
+# 10 steps * 0.3s ≈ 3 seconds.
+WAIT_STEPS=10
+WAIT_INTERVAL=0.3
+
 set -euo pipefail
 
 # ---- colors -----------------------------------------------------------
@@ -62,24 +80,6 @@ ${C_BOLD}ENV${C_RST}
 EOF
     exit 0
 fi
-
-# Command used to start the proxy ("sudo" is prepended below).
-# https://github.com/tun2proxy/tun2proxy
-PROXY_ARGS=(tun2proxy-bin --setup --proxy "$PROXY" --mtu "$MTU" \
-    --tcp-timeout "$TCP_TIMEOUT" --udp-timeout "$UDP_TIMEOUT" \
-    --dns virtual -6 -v "$VERBOSITY_LEVEL")
-
-STATE_DIR="$HOME/.local/state/t2p"
-LOG_FILE="$STATE_DIR/t2p.log"
-mkdir -p "$STATE_DIR"
-
-# Substring identifying our proxy process among all running processes.
-PROXY_MATCH="tun2proxy-bin"
-
-# Poll interval/count when waiting for the process to appear/disappear.
-# 10 steps * 0.3s ≈ 3 seconds.
-WAIT_STEPS=10
-WAIT_INTERVAL=0.3
 
 # ---- output helpers -----------------------------------------------------
 

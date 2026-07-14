@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+# t2p - wrapper around tun2proxy-bin: on/off/toggles a SOCKS5/HTTP tunnel via sudo in the background, without blocking the terminal. Process state is checked via pgrep each time; no PID file is used.
+# Notes:
+#   - "sudo -b" launches the process detached in the background and returns
+#     control immediately - no nohup/disown/& needed.
+#   - No PID file. State is derived each call via `pgrep -f` on PROXY_MATCH.
+#     This avoids stale state if the process was killed manually.
+# Usage:
+#   ./t2p on       # start proxy if not already running
+#   ./t2p off      # stop proxy if running
+#   ./t2p toggle   # start if stopped, stop if running
+#   ./t2p status   # print current state (default)
+#   ./t2p -e       # open this script in $EDITOR and exit
+#   ./t2p -l [N]   # show log (last N lines, or whole file)
+#   ./t2p -h       # show help
+
+PROXY="socks5://name:pass@host:port"
+VERBOSITY_LEVEL=warn
+MTU=8500
+TCP_TIMEOUT=15
+UDP_TIMEOUT=7
+
+set -euo pipefail
+
+# ---- colors -----------------------------------------------------------
+# Standard 8-color ANSI codes. Disabled automatically when output isn't
+# a terminal (e.g. piped to a file) or when NO_COLOR is set.
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    C_RED=$'\033[31m';    C_GREEN=$'\033[32m'
+    C_YEL=$'\033[33m';    C_BLUE=$'\033[34m'
+    C_CYAN=$'\033[36m';   C_BOLD=$'\033[1m'
+    C_DIM=$'\033[2m';     C_RST=$'\033[0m'
+else
+    C_RED=; C_GREEN=; C_YEL=; C_BLUE=; C_CYAN=; C_BOLD=; C_DIM=; C_RST=
+fi
+
+# -e: edit this script (handled first so it works even if config below breaks)
+if [[ "${1:-}" == "-e" ]]; then
+    exec "${EDITOR:-vi}" "$0"
+fi
+
+# -h / --help: show usage and exit
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    cat <<EOF
+${C_BOLD}${C_CYAN}t2p${C_RST} - wrapper around tun2proxy-bin: on/off/toggles a SOCKS5/HTTP tunnel via sudo in the background, without blocking the terminal. Process state is checked via pgrep each time; no PID file is used.
+${C_CYAN}https://github.com/tun2proxy/tun2proxy${C_RST}
+
+${C_BOLD}USAGE${C_RST}
+  t2p [command]
+
+${C_BOLD}COMMANDS${C_RST}
+  ${C_GREEN}on${C_RST}            start the proxy if not already running
+  ${C_GREEN}off${C_RST}           stop the proxy if running
+  ${C_GREEN}toggle${C_RST}        start if stopped, stop if running
+  ${C_GREEN}status${C_RST}        show current state ${C_DIM}(default)${C_RST}
+  ${C_GREEN}-e${C_RST}            open this script in \$EDITOR
+  ${C_GREEN}-l${C_RST} [N]        show log (last N lines, or whole file)
+  ${C_GREEN}-h${C_RST}, ${C_GREEN}--help${C_RST}    show this help
+
+${C_BOLD}ENV${C_RST}
+  ${C_BLUE}NO_COLOR${C_RST}      set to disable colored output
+EOF
+    exit 0
+fi
+
+# Command used to start the proxy ("sudo" is prepended below).
+# https://github.com/tun2proxy/tun2proxy
+PROXY_ARGS=(tun2proxy-bin --setup --proxy "$PROXY" --mtu "$MTU" \
+    --tcp-timeout "$TCP_TIMEOUT" --udp-timeout "$UDP_TIMEOUT" \
+    --dns virtual -6 -v "$VERBOSITY_LEVEL")
+
+STATE_DIR="$HOME/.local/state/t2p"
+LOG_FILE="$STATE_DIR/t2p.log"
+mkdir -p "$STATE_DIR"
+
+# Substring identifying our proxy process among all running processes.
+PROXY_MATCH="tun2proxy-bin"
+
+# Poll interval/count when waiting for the process to appear/disappear.
+# 10 steps * 0.3s ≈ 3 seconds.
+WAIT_STEPS=10
+WAIT_INTERVAL=0.3
+
+# ---- output helpers -----------------------------------------------------
+
+info() { printf '%s\n' "$*"; }
+ok()   { printf '%s[ OK ]%s %s\n'   "$C_GREEN" "$C_RST" "$*"; }
+warn() { printf '%s[WARN]%s %s\n'   "$C_YEL"   "$C_RST" "$*" >&2; }
+err()  { printf '%s[FAIL]%s %s\n'   "$C_RED"   "$C_RST" "$*" >&2; }
+
+# Aligned "label: value" row for the summary block.
+row() { printf '  %s%-8s%s %s\n' "$C_BLUE" "$1:" "$C_RST" "$2"; }
+
+# Show the log file. Uses `bat` if available, falls back to `cat`.
+# $1 (optional): number of trailing lines; whole file if omitted.
+read_log() {
+    local n="${1:-}"
+
+    if [[ ! -f "$LOG_FILE" ]]; then
+        err "Log file not found: $LOG_FILE"
+        exit 1
+    fi
+
+    if [[ -n "$n" && ! "$n" =~ ^[0-9]+$ ]]; then
+        err "Invalid line count: $n"
+        exit 1
+    fi
+
+    if [[ -n "$n" ]]; then
+        tail -n "$n" "$LOG_FILE"
+    else
+        if command -v bat >/dev/null 2>&1; then
+            bat --theme=ansi -p "$LOG_FILE"
+        else
+            cat "$LOG_FILE"
+        fi
+    fi
+}
+
+# -l: show log (doesn't need sudo or proxy args, so handled early)
+if [[ "${1:-}" == "-l" ]]; then
+    read_log "${2:-}"
+    exit 0
+fi
+
+ipinfo() {
+    local t=5
+    local out
+
+    # 1. api.myip.com
+    out=$(
+        curl -fsS --max-time "$t" https://api.myip.com 2>/dev/null |
+        jq -er '"\(.ip)\n\(.country), \(.cc)"'
+    ) && { printf '%s\n' "$out"; return 0; }
+
+    # 2. ipwho.is
+    out=$(
+        curl -fsS --max-time "$t" https://ipwho.is/ 2>/dev/null |
+        jq -er 'select(.success == true) |
+                "\(.ip)\n\(.country), \(.country_code)"'
+    ) && { printf '%s\n' "$out"; return 0; }
+
+    # 3. ipapi.co
+    out=$(
+        curl -fsS --max-time "$t" https://ipapi.co/json/ 2>/dev/null |
+        jq -er '"\(.ip)\n\(.country_name), \(.country_code)"'
+    ) && { printf '%s\n' "$out"; return 0; }
+
+    err "failed to retrieve IP information from all sources"
+    return 1
+}
+
+# Prints current exit IP/location as two aligned rows (or a failure row).
+print_ipinfo() {
+    local out ip loc
+    if out="$(ipinfo)"; then
+        ip="$(sed -n '1p' <<<"$out")"
+        loc="$(sed -n '2p' <<<"$out")"
+        row "IP" "$ip"
+        row "Location" "$loc"
+    else
+        row "IP" "unavailable"
+    fi
+}
+
+# All PIDs matching PROXY_MATCH, one per line (may be zero, one, or many).
+get_pids() {
+    pgrep -f "$PROXY_MATCH" || true
+}
+
+is_running() {
+    [[ -n "$(get_pids)" ]]
+}
+
+# PIDs as a single trimmed, space-separated string, for display.
+pids_oneline() {
+    get_pids | tr '\n' ' ' | sed 's/ $//'
+}
+
+start_proxy() {
+    if is_running; then
+        ok "Proxy already running"
+        row "PID" "$(pids_oneline)"
+        return 0
+    fi
+
+    info "Starting proxy..."
+    # ">>" runs as the calling user (sudo doesn't affect redirects),
+    # so $LOG_FILE stays owned by the user instead of root.
+    sudo -b "${PROXY_ARGS[@]}" >>"$LOG_FILE" 2>&1
+
+    # Poll instead of a fixed sleep, so slow startups aren't misreported
+    # as failures and fast startups don't wait longer than necessary.
+    for _ in $(seq 1 "$WAIT_STEPS"); do
+        if is_running; then
+            ok "Proxy started"
+            row "PID" "$(pids_oneline)"
+            return 0
+        fi
+        sleep "$WAIT_INTERVAL"
+    done
+
+    err "Proxy failed to start - see $LOG_FILE"
+    exit 1
+}
+
+stop_proxy() {
+    if ! is_running; then
+        ok "Proxy already stopped"
+        return 0
+    fi
+
+    local pids
+    pids="$(get_pids)"
+    info "Stopping proxy (PID $(pids_oneline))..."
+    # shellcheck disable=SC2086
+    sudo kill $pids
+
+    for _ in $(seq 1 "$WAIT_STEPS"); do
+        if ! is_running; then
+            ok "Proxy stopped"
+            return 0
+        fi
+        sleep "$WAIT_INTERVAL"
+    done
+
+    warn "Process did not exit in time, sending SIGKILL"
+    pids="$(get_pids)"
+    if [[ -n "$pids" ]]; then
+        # shellcheck disable=SC2086
+        sudo kill -9 $pids 2>/dev/null || true
+    fi
+}
+
+status_proxy() {
+    if is_running; then
+        row "Status" "${C_GREEN}running${C_RST}"
+        row "PID" "$(pids_oneline)"
+    else
+        row "Status" "${C_DIM}stopped${C_RST}"
+    fi
+}
+
+toggle_proxy() {
+    if is_running; then
+        stop_proxy
+    else
+        start_proxy
+    fi
+}
+
+case "${1:-status}" in
+    on)   start_proxy && sleep 1 ;;
+    off)    stop_proxy && sleep 1 ;;
+    toggle)  toggle_proxy && sleep 1 ;;
+    status)  status_proxy ;;
+    *)
+        err "Usage: $0 {on|off|status|toggle|-e|-l [N]|-h}"
+        exit 1
+        ;;
+esac
+
+print_ipinfo

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# t2p - wrapper around tun2proxy-bin: on/off/toggles a SOCKS5/HTTP tunnel via sudo in the background, without blocking the terminal. Process state is checked via pgrep each time; no PID file is used.
+# t2p - wrapper around tun2proxy-bin: on/off/toggles/restarts a SOCKS5/HTTP tunnel via sudo in the background, without blocking the terminal. Process state is checked via pgrep each time; no PID file is used.
 # Notes:
 #   - "sudo -b" launches the process detached in the background and returns
 #     control immediately - no nohup/disown/& needed.
@@ -8,21 +8,32 @@
 # Usage:
 #   ./t2p on       # start proxy if not already running
 #   ./t2p off      # stop proxy if running
+#   ./t2p restart  # restart proxy if running, start it if stopped
 #   ./t2p toggle   # start if stopped, stop if running
 #   ./t2p status   # print current state (default)
 #   ./t2p -e       # open this script in $EDITOR and exit
 #   ./t2p -l [N]   # show log (last N lines, or whole file)
 #   ./t2p -h       # show help
 
+set -euo pipefail
+
+# config
 PROXY="socks5://name:pass@host:port"
 VERBOSITY_LEVEL=warn
-MTU=8500
-TCP_TIMEOUT=15
-UDP_TIMEOUT=7
+MTU=1500
+TCP_TIMEOUT=1500
+UDP_TIMEOUT=900
+MAX_SESSIONS=200
+
+# golobal env proxy
+if [ -n "$T2P_PROXY" ]; then
+    PROXY=$T2P_PROXY
+fi
 
 # Command used to start the proxy ("sudo" is prepended below).
 # https://github.com/tun2proxy/tun2proxy
 PROXY_ARGS=(tun2proxy-bin --setup --proxy "$PROXY" --mtu "$MTU" \
+    --max-sessions "$MAX_SESSIONS"\
     --tcp-timeout "$TCP_TIMEOUT" --udp-timeout "$UDP_TIMEOUT" \
     --dns virtual -6 -v "$VERBOSITY_LEVEL")
 
@@ -38,9 +49,9 @@ PROXY_MATCH="tun2proxy-bin"
 WAIT_STEPS=10
 WAIT_INTERVAL=0.3
 
-set -euo pipefail
+# Short delay between stopping and starting during restart.
+RESTART_DELAY=0.3
 
-# ---- colors -----------------------------------------------------------
 # Standard 8-color ANSI codes. Disabled automatically when output isn't
 # a terminal (e.g. piped to a file) or when NO_COLOR is set.
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
@@ -60,7 +71,7 @@ fi
 # -h / --help: show usage and exit
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     cat <<EOF
-${C_BOLD}${C_CYAN}t2p${C_RST} - wrapper around tun2proxy-bin: on/off/toggles a SOCKS5/HTTP tunnel via sudo in the background, without blocking the terminal. Process state is checked via pgrep each time; no PID file is used.
+${C_BOLD}${C_CYAN}t2p${C_RST} - wrapper around tun2proxy-bin: on/off/toggles/restarts a SOCKS5/HTTP tunnel via sudo in the background, without blocking the terminal. Process state is checked via pgrep each time; no PID file is used.
 ${C_CYAN}https://github.com/tun2proxy/tun2proxy${C_RST}
 
 ${C_BOLD}USAGE${C_RST}
@@ -69,6 +80,7 @@ ${C_BOLD}USAGE${C_RST}
 ${C_BOLD}COMMANDS${C_RST}
   ${C_GREEN}on${C_RST}            start the proxy if not already running
   ${C_GREEN}off${C_RST}           stop the proxy if running
+  ${C_GREEN}restart${C_RST}       restart if running, start if stopped
   ${C_GREEN}toggle${C_RST}        start if stopped, stop if running
   ${C_GREEN}status${C_RST}        show current state ${C_DIM}(default)${C_RST}
   ${C_GREEN}-e${C_RST}            open this script in \$EDITOR
@@ -80,8 +92,6 @@ ${C_BOLD}ENV${C_RST}
 EOF
     exit 0
 fi
-
-# ---- output helpers -----------------------------------------------------
 
 info() { printf '%s\n' "$*"; }
 ok()   { printf '%s[ OK ]%s %s\n'   "$C_GREEN" "$C_RST" "$*"; }
@@ -123,37 +133,52 @@ if [[ "${1:-}" == "-l" ]]; then
     exit 0
 fi
 
-ipinfo() {
-    local t=5
+myip() {
     local out
+
+    local curl_args=(
+        curl
+        -fsSL
+        --max-time 5
+        --retry 2
+    )
 
     # 1. api.myip.com
     out=$(
-        curl -fsS --max-time "$t" https://api.myip.com 2>/dev/null |
+        "${curl_args[@]}" https://api.myip.com 2>/dev/null |
         jq -er '"\(.ip)\n\(.country), \(.cc)"'
-    ) && { printf '%s\n' "$out"; return 0; }
+    ) && {
+        printf '%s\n' "$out"
+        return 0
+    }
 
     # 2. ipwho.is
     out=$(
-        curl -fsS --max-time "$t" https://ipwho.is/ 2>/dev/null |
+        "${curl_args[@]}" https://ipwho.is/ 2>/dev/null |
         jq -er 'select(.success == true) |
                 "\(.ip)\n\(.country), \(.country_code)"'
-    ) && { printf '%s\n' "$out"; return 0; }
+    ) && {
+        printf '%s\n' "$out"
+        return 0
+    }
 
     # 3. ipapi.co
     out=$(
-        curl -fsS --max-time "$t" https://ipapi.co/json/ 2>/dev/null |
+        "${curl_args[@]}" https://ipapi.co/json/ 2>/dev/null |
         jq -er '"\(.ip)\n\(.country_name), \(.country_code)"'
-    ) && { printf '%s\n' "$out"; return 0; }
+    ) && {
+        printf '%s\n' "$out"
+        return 0
+    }
 
-    err "failed to retrieve IP information from all sources"
+    echo "Error: failed to retrieve IP information from all sources." >&2
     return 1
 }
 
 # Prints current exit IP/location as two aligned rows (or a failure row).
 print_ipinfo() {
     local out ip loc
-    if out="$(ipinfo)"; then
+    if out="$(myip)"; then
         ip="$(sed -n '1p' <<<"$out")"
         loc="$(sed -n '2p' <<<"$out")"
         row "IP" "$ip"
@@ -232,6 +257,15 @@ stop_proxy() {
     fi
 }
 
+restart_proxy() {
+    if is_running; then
+        stop_proxy
+        sleep "$RESTART_DELAY"
+    fi
+
+    start_proxy
+}
+
 status_proxy() {
     if is_running; then
         row "Status" "${C_GREEN}running${C_RST}"
@@ -250,12 +284,13 @@ toggle_proxy() {
 }
 
 case "${1:-status}" in
-    on)   start_proxy && sleep 1 ;;
-    off)    stop_proxy && sleep 1 ;;
+    on)      start_proxy && sleep 1 ;;
+    off)     stop_proxy && sleep 1 ;;
+    restart) restart_proxy && sleep 1 ;;
     toggle)  toggle_proxy && sleep 1 ;;
     status)  status_proxy ;;
     *)
-        err "Usage: $0 {on|off|status|toggle|-e|-l [N]|-h}"
+        err "Usage: $0 {on|off|restart|status|toggle|-e|-l [N]|-h}"
         exit 1
         ;;
 esac

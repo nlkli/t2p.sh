@@ -6,14 +6,14 @@
 #   - No PID file. State is derived each call via `pgrep -f` on PROXY_MATCH.
 #     This avoids stale state if the process was killed manually.
 # Usage:
-#   ./t2p on       # start proxy if not already running
-#   ./t2p off      # stop proxy if running
-#   ./t2p restart  # restart proxy if running, start it if stopped
-#   ./t2p toggle   # start if stopped, stop if running
-#   ./t2p status   # print current state (default)
-#   ./t2p -e       # open this script in $EDITOR and exit
-#   ./t2p -l [N]   # show log (last N lines, or whole file)
-#   ./t2p -h       # show help
+#   ./t2p on         # start proxy if not already running
+#   ./t2p off        # stop proxy if running
+#   ./t2p r/restart  # restart proxy if running, start it if stopped
+#   ./t2p t/toggle   # start if stopped, stop if running
+#   ./t2p s/status   # print current state (default)
+#   ./t2p -e         # open this script in $EDITOR and exit
+#   ./t2p -l [N]     # show log (last N lines, or whole file)
+#   ./t2p -h         # show help
 
 set -euo pipefail
 
@@ -80,9 +80,9 @@ ${C_BOLD}USAGE${C_RST}
 ${C_BOLD}COMMANDS${C_RST}
   ${C_GREEN}on${C_RST}            start the proxy if not already running
   ${C_GREEN}off${C_RST}           stop the proxy if running
-  ${C_GREEN}restart${C_RST}       restart if running, start if stopped
-  ${C_GREEN}toggle${C_RST}        start if stopped, stop if running
-  ${C_GREEN}status${C_RST}        show current state ${C_DIM}(default)${C_RST}
+  ${C_GREEN}r/restart${C_RST}     restart if running, start if stopped
+  ${C_GREEN}t/toggle${C_RST}      start if stopped, stop if running
+  ${C_GREEN}s/status${C_RST}      show current state ${C_DIM}(default)${C_RST}
   ${C_GREEN}-e${C_RST}            open this script in \$EDITOR
   ${C_GREEN}-l${C_RST} [N]        show log (last N lines, or whole file)
   ${C_GREEN}-h${C_RST}, ${C_GREEN}--help${C_RST}    show this help
@@ -287,10 +287,13 @@ case "${1:-status}" in
     on)      start_proxy && sleep 1 ;;
     off)     stop_proxy && sleep 1 ;;
     restart) restart_proxy && sleep 1 ;;
+    r) restart_proxy && sleep 1 ;;
     toggle)  toggle_proxy && sleep 1 ;;
+    t)  toggle_proxy && sleep 1 ;;
     status)  status_proxy ;;
+    s)  status_proxy ;;
     *)
-        err "Usage: $0 {on|off|restart|status|toggle|-e|-l [N]|-h}"
+        err "Usage: $0 {on|off|r/restart|s/status|t/toggle|-e|-l [N]|-h}"
         exit 1
         ;;
 esac

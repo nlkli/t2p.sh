@@ -21,9 +21,10 @@ set -euo pipefail
 PROXY="socks5://name:pass@host:port"
 VERBOSITY_LEVEL=warn
 MTU=1500
-TCP_TIMEOUT=1500
-UDP_TIMEOUT=900
+TCP_TIMEOUT=14
+UDP_TIMEOUT=9
 MAX_SESSIONS=200
+DNS=over-tcp # virtual, over-tcp, direct
 
 # golobal env proxy
 if [ -n "$T2P_PROXY" ]; then
@@ -35,7 +36,7 @@ fi
 PROXY_ARGS=(tun2proxy-bin --setup --proxy "$PROXY" --mtu "$MTU" \
     --max-sessions "$MAX_SESSIONS"\
     --tcp-timeout "$TCP_TIMEOUT" --udp-timeout "$UDP_TIMEOUT" \
-    --dns virtual -6 -v "$VERBOSITY_LEVEL")
+    --dns "$DNS" -6 -v "$VERBOSITY_LEVEL")
 
 STATE_DIR="$HOME/.local/state/t2p"
 LOG_FILE="$STATE_DIR/t2p.log"
